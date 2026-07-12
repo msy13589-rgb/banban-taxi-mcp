@@ -49,12 +49,11 @@ def _hour_from(ride_time: str | None) -> int:
     name="splitTaxi",
     title="반반택시 합승 정산",
     description=(
-        "Given one origin and two different destinations, plans a fair shared-taxi "
-        "split for two people. IMPORTANT: it identifies the branch point — the actual "
-        "subway station where the two riders should part ways (one gets off to transfer, "
-        "the other stays in the taxi) — and always report this branch station to the user. "
-        "It splits the total savings equally and returns each person's fair payment, the "
-        "branch-point guidance, plus Kakao Map and Kakao T links. Service: BanBan Taxi(반반택시)."
+        "같은 출발지에서 서로 다른 목적지로 가는 두 사람의 택시 합승을 도와주는 "
+        "반반택시(BanBan Taxi) 서비스입니다. 두 경로가 갈라지는 분기점(갈아탈 지하철역)을 "
+        "찾아 '여기까지 같이 타고, 한 명은 내려서 갈아타세요'라고 안내하고, 아낀 택시비를 "
+        "공평하게 나눠 각자 낼 금액·절약액을 알려줍니다. 카카오맵 경로와 카카오T 호출 "
+        "링크도 함께 제공합니다."
     ),
     annotations=ToolAnnotations(
         title="반반택시 합승 정산",
