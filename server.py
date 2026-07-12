@@ -16,7 +16,9 @@ from mcp.types import ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from split_logic import geocode, compute_split, kakao_map_car_url, kakao_t_url
+from split_logic import (
+    geocode, compute_split, kakao_map_car_url, kakao_map_point_url, kakao_t_url,
+)
 
 mcp = FastMCP(
     "banban-taxi",
@@ -48,9 +50,11 @@ def _hour_from(ride_time: str | None) -> int:
     title="반반택시 합승 정산",
     description=(
         "Given one origin and two different destinations, plans a fair shared-taxi "
-        "split for two people: finds the overlapping segment, splits the total savings "
-        "equally, and returns each person's fair payment plus Kakao Map and Kakao T links. "
-        "Service: BanBan Taxi(반반택시)."
+        "split for two people. IMPORTANT: it identifies the branch point — the actual "
+        "subway station where the two riders should part ways (one gets off to transfer, "
+        "the other stays in the taxi) — and always report this branch station to the user. "
+        "It splits the total savings equally and returns each person's fair payment, the "
+        "branch-point guidance, plus Kakao Map and Kakao T links. Service: BanBan Taxi(반반택시)."
     ),
     annotations=ToolAnnotations(
         title="반반택시 합승 정산",
@@ -103,6 +107,10 @@ def split_taxi(
         "탑승시각_시": hour,
         "심야할증": hour >= 22 or hour < 4,
         "링크": {
+            "분기점_지도": kakao_map_point_url(
+                result.get("분기점", "분기점"),
+                result["분기점_좌표"]["lat"], result["분기점_좌표"]["lng"],
+            ),
             "카카오맵_A": kakao_map_car_url(o, a),
             "카카오맵_B": kakao_map_car_url(o, b),
             "카카오T_A": kakao_t_url(o, a),
