@@ -82,73 +82,133 @@ def branch_point(o: dict, a: dict, b: dict, s: float, dOA: float, dOB: float) ->
         station = None
     fork["역"] = station["name"] if station else None
     fork["역까지_m"] = station["dist_m"] if station else None
+    if station:
+        # 지도 링크에는 추정 좌표 대신 실제 역 좌표를 사용 → 경로와 분기점이 일치
+        fork["lat"], fork["lng"] = station["lat"], station["lng"]
     return fork
 
 
 def compute_split(o: dict, a: dict, b: dict, hour: int | None = None) -> dict:
-    """좌표 3개(출발 o, 목적지 a/b)로 합승 정산 계산. (순수 계산 + 분기점 역 조회)"""
+    """좌표 3개(출발 o, 목적지 a/b)로 합승 정산 계산.
+
+    3가지 방식을 모두 비교해 가장 싼 방식을 추천:
+    1. 분기점_환승: 분기점까지 같이 타고, 한 명이 내려서 갈아탐
+    2. 경유_하차: 한 택시로 가까운 목적지 들러 내려주고, 그대로 먼 목적지까지 (환승 없음)
+    3. 따로_타기: 위 방식들이 따로 타는 것보다 비싸면 따로 타라고 안내
+    """
     dOA, dOB, dAB = road_km(o, a), road_km(o, b), road_km(a, b)
     s = max((dOA + dOB - dAB) / 2, 0.0)          # 겹치는 구간 거리
     a_alone, b_alone = estimate_fare(dOA, hour), estimate_fare(dOB, hour)
+    separate_total = a_alone + b_alone
 
     PA, PB = max(dOA - s, 0.0), max(dOB - s, 0.0)  # 분기점 이후 각자 남은 거리
     cab_to_a, cab_to_b = estimate_fare(dOA, hour), estimate_fare(dOB, hour)
 
-    # 4가지 시나리오: (누가 끝까지 타나, 내리는 사람 이동수단) → 합승 총비용
-    scenarios = [
-        {"stay": "B", "off": "A", "mode": "택시",   "total": cab_to_b + estimate_fare(PA, hour)},
-        {"stay": "B", "off": "A", "mode": "대중교통", "total": cab_to_b + TRANSIT_FARE},
-        {"stay": "A", "off": "B", "mode": "택시",   "total": cab_to_a + estimate_fare(PB, hour)},
-        {"stay": "A", "off": "B", "mode": "대중교통", "total": cab_to_a + TRANSIT_FARE},
+    # 시나리오 비교 — 환승형(분기점에서 한 명 하차 후 갈아탐) + 경유형(택시가 두 목적지 순서대로 방문)
+    scenarios = []
+    # 환승형 조건: 겹치는 구간이 절대적으로(0.4km↑) + 상대적으로(짧은 경로의 30%↑) 의미 있어야 함
+    # → 방향이 반대인 두 목적지에 억지로 환승을 추천하는 것을 방지
+    if s >= 0.4 and s >= 0.3 * min(dOA, dOB):
+        scenarios += [
+            {"type": "환승", "stay": "B", "off": "A", "mode": "택시",   "total": cab_to_b + estimate_fare(PA, hour)},
+            {"type": "환승", "stay": "A", "off": "B", "mode": "택시",   "total": cab_to_a + estimate_fare(PB, hour)},
+        ]
+        # 대중교통 환승은 잔여 거리가 짧을 때만 현실적 (심야 막차·소요시간 고려)
+        if PA <= 8.0:
+            scenarios.append({"type": "환승", "stay": "B", "off": "A", "mode": "대중교통", "total": cab_to_b + TRANSIT_FARE})
+        if PB <= 8.0:
+            scenarios.append({"type": "환승", "stay": "A", "off": "B", "mode": "대중교통", "total": cab_to_a + TRANSIT_FARE})
+    # 경유형: A 먼저 들르고 B까지 / B 먼저 들르고 A까지 (택시 1대, 환승 없음)
+    scenarios += [
+        {"type": "경유", "stay": "B", "off": "A", "mode": "없음(경유 하차)", "total": estimate_fare(dOA + dAB, hour)},
+        {"type": "경유", "stay": "A", "off": "B", "mode": "없음(경유 하차)", "total": estimate_fare(dOB + dAB, hour)},
     ]
     best = min(scenarios, key=lambda x: x["total"])
     split = equal_savings_split(a_alone, b_alone, best["total"])
 
-    # 분기점: 두 목적지 이름을 실제로 매핑 (off/stay 는 A/B 기호)
-    dest_name = {"A": a["name"], "B": b["name"]}
-    off_name, stay_name = dest_name[best["off"]], dest_name[best["stay"]]
+    # 차선책: 채택되지 않은 다른 유형 중 가장 싼 것 (예: 환승 대신 경유 하차하면 얼마인지)
+    others = [x for x in scenarios if x["type"] != best["type"]]
+    alt = min(others, key=lambda x: x["total"]) if others else None
 
-    fork = branch_point(o, a, b, s, dOA, dOB)
-    fork_label = fork["역"] or "분기 지점(가까운 역 없음)"
+    # off/stay 기호(A/B) → 실제 이름·지점 매핑
+    dest_pt = {"A": a, "B": b}
+    off_pt, stay_pt = dest_pt[best["off"]], dest_pt[best["stay"]]
+    off_name, stay_name = off_pt["name"], stay_pt["name"]
 
-    worth = split["총_절약액"] > 0 and s >= 0.4  # 합승 이득 판단
-    타는말 = "대중교통으로" if best["mode"] == "대중교통" else "택시로"
-    if worth:
+    worth = split["총_절약액"] > 0  # 따로 타는 것보다 실제로 싸야만 합승 추천
+
+    if not worth:
+        # ⭐ 따로 타는 게 더 싸거나 같음 → 명확히 따로 타라고 안내
+        방식 = "따로_타기"
+        fork_label, fork = None, None
+        안내 = (
+            f"🚕 이 경우엔 합승보다 따로 타는 게 더 낫습니다. "
+            f"합승 최저 비용 {best['total']:,}원 ≥ 따로 탈 때 {separate_total:,}원. "
+            f"각자 택시를 타세요 — {a['name']} {a_alone:,}원, {b['name']} {b_alone:,}원."
+        )
+    elif best["type"] == "경유":
+        # ⭐ 한 택시로 가까운 목적지 먼저 들르는 게 최선 (환승 없음)
+        방식 = "경유_하차"
+        fork = off_pt  # '갈라지는 지점' = 먼저 내리는 목적지 그 자체
+        fork_label = off_name
+        안내 = (
+            f"👉 한 택시로 {o['name']}에서 출발해 {off_name}에 먼저 들러 한 명을 내려주고, "
+            f"그대로 {stay_name}까지 갑니다. 갈아탈 필요가 없어 가장 편하고 저렴한 방식입니다."
+        )
+    else:
+        방식 = "분기점_환승"
+        fork = branch_point(o, a, b, s, dOA, dOB)
+        fork_label = fork["역"] or "분기 지점(가까운 역 없음)"
+        타는말 = "대중교통으로" if best["mode"] == "대중교통" else "택시로"
         안내 = (
             f"👉 {o['name']}에서 함께 택시를 타고 '{fork_label}' 부근까지 이동하세요. "
             f"거기서 {off_name} 가는 사람이 내려 {타는말} 갈아타고, "
             f"{stay_name} 가는 사람은 그대로 택시로 목적지까지 갑니다."
         )
-    else:
-        안내 = "두 목적지 방향이 거의 바로 갈라져 합승 이득이 크지 않아요. 따로 타는 편이 나을 수 있어요."
 
-    return {
+    result = {
         "합승_추천": worth,
-        "분기점": fork_label,                     # ⭐ 어디서 갈라지는지 (역 이름)
-        "분기점_좌표": {"lat": round(fork["lat"], 6), "lng": round(fork["lng"], 6)},
-        "분기점_안내": 안내,                        # ⭐ 누가 어디서 내려 뭘로 갈아타는지
+        "방식": 방식,                              # ⭐ 분기점_환승 | 경유_하차 | 따로_타기
+        "분기점": fork_label,                     # 어디서 갈라지는지 (환승: 역 / 경유: 먼저 내리는 목적지)
+        "분기점_안내": 안내,                        # ⭐ 누가 어디서 내려 어떻게 가는지
         "겹치는_구간_km": round(s, 2),
         "내리는_사람": off_name,
         "끝까지_타는_사람": stay_name,
-        "갈아탈_교통수단": best["mode"],
+        "갈아탈_교통수단": best["mode"] if worth else "해당없음(각자 이동)",
         "A_혼자": a_alone, "B_혼자": b_alone,
         **split,
         "출발": o["name"], "A_목적지": a["name"], "B_목적지": b["name"],
     }
+    if worth:
+        result["분기점_좌표"] = {"lat": round(fork["lat"], 6), "lng": round(fork["lng"], 6)}
+        if alt is not None:
+            방식명 = {"환승": "분기점 환승", "경유": "경유 하차"}
+            result["대안"] = (
+                f"{방식명[alt['type']]} 방식은 총 {alt['total']:,}원"
+                f" ({'+' if alt['total'] >= best['total'] else '-'}{abs(alt['total'] - best['total']):,}원)"
+            )
+    else:
+        # 따로 타기: 각자 그냥 내면 됨 (균등절약 정산 불필요)
+        result.update({"A_지불": a_alone, "B_지불": b_alone, "A_절약": 0, "B_절약": 0})
+    return result
+
+
+def _pt(p: dict) -> str:
+    return f"{quote(p['name'], safe='')},{p['lat']},{p['lng']}"
+
+
+def kakao_map_route_url(points: list[dict], by: str = "car") -> str:
+    """여러 지점을 순서대로 잇는 카카오맵 경로 링크.
+    예: 출발지 → 분기점 → 목적지가 한 지도에 함께 보임.
+    각 지점은 {"name", "lat", "lng"} dict.
+    """
+    return f"https://map.kakao.com/link/by/{by}/" + "/".join(_pt(p) for p in points)
 
 
 def kakao_map_car_url(o: dict, dest: dict) -> str:
-    def pt(p):
-        return f"{quote(p['name'], safe='')},{p['lat']},{p['lng']}"
-    return f"https://map.kakao.com/link/by/car/{pt(o)}/{pt(dest)}"
+    return kakao_map_route_url([o, dest], by="car")
 
 
 def kakao_map_point_url(name: str, lat: float, lng: float) -> str:
     """분기점 위치를 카카오맵에서 바로 보여주는 링크."""
     return f"https://map.kakao.com/link/map/{quote(name, safe='')},{lat},{lng}"
-
-
-def kakao_t_url(o: dict, dest: dict) -> str:
-    # 카카오T 택시 호출용 딥링크 (출발/도착 좌표 전달)
-    return (f"kakaotaxi://launch?sx={o['lng']}&sy={o['lat']}"
-            f"&ex={dest['lng']}&ey={dest['lat']}")
