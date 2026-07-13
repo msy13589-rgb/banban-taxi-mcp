@@ -17,7 +17,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from split_logic import (
-    geocode, compute_split, kakao_map_route_url, kakao_map_point_url,
+    geocode, compute_split, compute_pickup, kakao_map_route_url, kakao_map_point_url,
 )
 
 mcp = FastMCP(
@@ -134,6 +134,103 @@ def split_taxi(
             "분기점_지도": kakao_map_point_url(fork_pt["name"], fork_pt["lat"], fork_pt["lng"]),
         }
         warnings.append("전체경로_지도의 마지막 구간(목적지1→목적지2)은 지점 표시용이며 실제 이동 경로가 아닙니다.")
+
+    result.update({
+        "ok": True,
+        "탑승시각_시": hour,
+        "심야할증": hour >= 22 or hour < 4,
+        "링크": links,
+        "주의": (warnings + [
+            "요금·거리는 직선거리 기반 추정치이며 실제와 다를 수 있습니다.",
+            "대중교통 요금/막차 여부는 카카오맵 링크로 확인하세요.",
+            "택시 호출은 카카오맵 경로 화면의 '택시' 탭에서 카카오T로 바로 연결됩니다.",
+        ]),
+    })
+    return result
+
+
+@mcp.tool(
+    name="pickupTaxi",
+    title="반반택시 픽업 합승 정산",
+    description=(
+        "서로 다른 곳에서 출발해 같은 목적지로 가는 두 사람의 택시 합승을 도와주는 "
+        "반반택시(BanBan Taxi) 서비스입니다. 3가지 방식을 비교해 가장 싼 방법을 추천합니다: "
+        "① 한 택시가 친구 출발지에 들러 태우고 가는 '픽업 경유', "
+        "② 한 명이 대중교통/택시로 합류점까지 와서 같이 타는 '합류점 환승', "
+        "③ 합승이 오히려 손해면 '따로 타기'를 권합니다. 같이 탄 구간은 반반, 이후는 각자 "
+        "부담하는 공정한 정산과 카카오맵 경로 링크를 제공합니다. "
+        "예: '나는 성신여대입구, 친구는 군자역에서 출발해서 같이 서울역 가려고 해'."
+    ),
+    annotations=ToolAnnotations(
+        title="반반택시 픽업 합승 정산",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+def pickup_taxi(
+    origin_a: str,
+    origin_b: str,
+    destination: str,
+    ride_time: str | None = None,
+) -> dict:
+    """두 사람이 서로 다른 출발지에서 같은 목적지로 갈 때, 픽업 합승 정산을 계산합니다.
+
+    Args:
+        origin_a: A의 출발지 (예: "성신여대입구역")
+        origin_b: B의 출발지 (예: "군자역")
+        destination: 공통 목적지 (예: "서울역")
+        ride_time: 탑승 시각 "HH:MM" (심야할증 판단, 생략 시 현재 시각)
+    """
+    hour = _hour_from(ride_time)
+    warnings: list[str] = []
+
+    try:
+        oa = geocode(origin_a)
+        ob = geocode(origin_b)
+        d = geocode(destination)
+    except RuntimeError as exc:
+        return {"ok": False, "error": f"카카오 API 설정 오류: {exc}"}
+    except Exception:
+        return {"ok": False, "error": "장소 검색 중 카카오 API 요청에 실패했습니다."}
+
+    missing = [n for n, p in [(origin_a, oa), (origin_b, ob), (destination, d)] if p is None]
+    if missing:
+        return {
+            "ok": False,
+            "error": f"다음 장소를 찾지 못했습니다: {', '.join(missing)}. 더 구체적인 지역/역명을 알려주세요.",
+        }
+
+    result = compute_pickup(oa, ob, d, hour=hour)
+
+    first_pt = oa if result["먼저_타는_사람"] == oa["name"] else ob
+    late_pt = ob if first_pt is oa else oa
+
+    방식 = result["방식"]
+    if 방식 == "따로_타기":
+        links = {
+            f"{oa['name']}_경로": kakao_map_route_url([oa, d]),
+            f"{ob['name']}_경로": kakao_map_route_url([ob, d]),
+        }
+        warnings.append("합승보다 각자 이동하는 게 저렴합니다.")
+    elif 방식 == "픽업_경유":
+        # 택시 1대: 먼저 타는 사람 출발지 → 친구 픽업 → 목적지 (실제 이동 경로 그대로)
+        links = {
+            "전체경로_지도": kakao_map_route_url([first_pt, late_pt, d]),
+            "픽업_장소": kakao_map_point_url(late_pt["name"], late_pt["lat"], late_pt["lng"]),
+        }
+    else:  # 합류점_환승
+        join_pt = {
+            "name": result.get("합류점") or "합류점",
+            "lat": result["합류점_좌표"]["lat"],
+            "lng": result["합류점_좌표"]["lng"],
+        }
+        links = {
+            "합승택시_경로": kakao_map_route_url([first_pt, join_pt, d]),
+            "합류_경로": kakao_map_route_url([late_pt, join_pt]),
+            "합류점_지도": kakao_map_point_url(join_pt["name"], join_pt["lat"], join_pt["lng"]),
+        }
 
     result.update({
         "ok": True,

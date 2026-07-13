@@ -105,26 +105,62 @@ def compute_split(o: dict, a: dict, b: dict, hour: int | None = None) -> dict:
     cab_to_a, cab_to_b = estimate_fare(dOA, hour), estimate_fare(dOB, hour)
 
     # 시나리오 비교 — 환승형(분기점에서 한 명 하차 후 갈아탐) + 경유형(택시가 두 목적지 순서대로 방문)
+    # 각 시나리오에 정산용 분해값 포함: s_fare(같이 탄 구간 요금), stay_taxi(택시 미터 총액), off_extra(내린 사람 추가 비용)
+    s_fare = estimate_fare(s, hour) if s > 0 else 0
     scenarios = []
     # 환승형 조건: 겹치는 구간이 절대적으로(0.4km↑) + 상대적으로(짧은 경로의 30%↑) 의미 있어야 함
     # → 방향이 반대인 두 목적지에 억지로 환승을 추천하는 것을 방지
     if s >= 0.4 and s >= 0.3 * min(dOA, dOB):
         scenarios += [
-            {"type": "환승", "stay": "B", "off": "A", "mode": "택시",   "total": cab_to_b + estimate_fare(PA, hour)},
-            {"type": "환승", "stay": "A", "off": "B", "mode": "택시",   "total": cab_to_a + estimate_fare(PB, hour)},
+            {"type": "환승", "stay": "B", "off": "A", "mode": "택시",
+             "s_fare": s_fare, "stay_taxi": cab_to_b, "off_extra": estimate_fare(PA, hour),
+             "total": cab_to_b + estimate_fare(PA, hour)},
+            {"type": "환승", "stay": "A", "off": "B", "mode": "택시",
+             "s_fare": s_fare, "stay_taxi": cab_to_a, "off_extra": estimate_fare(PB, hour),
+             "total": cab_to_a + estimate_fare(PB, hour)},
         ]
         # 대중교통 환승은 잔여 거리가 짧을 때만 현실적 (심야 막차·소요시간 고려)
         if PA <= 8.0:
-            scenarios.append({"type": "환승", "stay": "B", "off": "A", "mode": "대중교통", "total": cab_to_b + TRANSIT_FARE})
+            scenarios.append({"type": "환승", "stay": "B", "off": "A", "mode": "대중교통",
+                              "s_fare": s_fare, "stay_taxi": cab_to_b, "off_extra": TRANSIT_FARE,
+                              "total": cab_to_b + TRANSIT_FARE})
         if PB <= 8.0:
-            scenarios.append({"type": "환승", "stay": "A", "off": "B", "mode": "대중교통", "total": cab_to_a + TRANSIT_FARE})
+            scenarios.append({"type": "환승", "stay": "A", "off": "B", "mode": "대중교통",
+                              "s_fare": s_fare, "stay_taxi": cab_to_a, "off_extra": TRANSIT_FARE,
+                              "total": cab_to_a + TRANSIT_FARE})
     # 경유형: A 먼저 들르고 B까지 / B 먼저 들르고 A까지 (택시 1대, 환승 없음)
     scenarios += [
-        {"type": "경유", "stay": "B", "off": "A", "mode": "없음(경유 하차)", "total": estimate_fare(dOA + dAB, hour)},
-        {"type": "경유", "stay": "A", "off": "B", "mode": "없음(경유 하차)", "total": estimate_fare(dOB + dAB, hour)},
+        {"type": "경유", "stay": "B", "off": "A", "mode": "없음(경유 하차)",
+         "s_fare": estimate_fare(dOA, hour), "stay_taxi": estimate_fare(dOA + dAB, hour), "off_extra": 0,
+         "total": estimate_fare(dOA + dAB, hour)},
+        {"type": "경유", "stay": "A", "off": "B", "mode": "없음(경유 하차)",
+         "s_fare": estimate_fare(dOB, hour), "stay_taxi": estimate_fare(dOB + dAB, hour), "off_extra": 0,
+         "total": estimate_fare(dOB + dAB, hour)},
     ]
     best = min(scenarios, key=lambda x: x["total"])
-    split = equal_savings_split(a_alone, b_alone, best["total"])
+
+    # ⭐ 반반 정산: 같이 탄 구간은 반반, 그 이후는 각자 부담
+    #    → 중간에 내려 갈아타는(수고하는) 사람이 더 내는 불공정 방지
+    alone = {"A": a_alone, "B": b_alone}
+    off_alone, stay_alone = alone[best["off"]], alone[best["stay"]]
+    half = best["s_fare"] / 2
+    off_pay = int(round((half + best["off_extra"]) / 100.0) * 100)
+    stay_pay = best["total"] - off_pay
+    # 안전장치: 혼자 탈 때보다 더 내는 사람이 없도록 보정
+    if off_pay > off_alone:
+        off_pay, stay_pay = off_alone, best["total"] - off_alone
+    if stay_pay > stay_alone:
+        stay_pay, off_pay = stay_alone, best["total"] - stay_alone
+    pays = {best["off"]: off_pay, best["stay"]: stay_pay}
+    split = {
+        "따로_탈때_합계": separate_total,
+        "합승_총비용": best["total"],
+        "총_절약액": separate_total - best["total"],
+        "A_지불": pays["A"], "B_지불": pays["B"],
+        "A_절약": a_alone - pays["A"], "B_절약": b_alone - pays["B"],
+        "합승_이득": separate_total - best["total"] > 0,
+        "정산_방식": "같이 탄 구간은 반반, 그 이후 구간·환승비는 각자 부담",
+    }
 
     # 차선책: 채택되지 않은 다른 유형 중 가장 싼 것 (예: 환승 대신 경유 하차하면 얼마인지)
     others = [x for x in scenarios if x["type"] != best["type"]]
@@ -188,9 +224,60 @@ def compute_split(o: dict, a: dict, b: dict, hour: int | None = None) -> dict:
                 f" ({'+' if alt['total'] >= best['total'] else '-'}{abs(alt['total'] - best['total']):,}원)"
             )
     else:
-        # 따로 타기: 각자 그냥 내면 됨 (균등절약 정산 불필요)
-        result.update({"A_지불": a_alone, "B_지불": b_alone, "A_절약": 0, "B_절약": 0})
+        # 따로 타기: 각자 그냥 내면 됨
+        result.update({"A_지불": a_alone, "B_지불": b_alone, "A_절약": 0, "B_절약": 0,
+                       "정산_방식": "각자 자기 택시비 부담"})
     return result
+
+
+def compute_pickup(o_a: dict, o_b: dict, dest: dict, hour: int | None = None) -> dict:
+    """출발지가 다르고 목적지가 같은 두 사람의 픽업 합승 계산.
+
+    수학적으로 '목적지에서 두 출발지로 흩어지는' 문제의 역방향이므로
+    compute_split을 재사용하고, 안내·라벨만 순방향(픽업/합류)으로 바꿔준다.
+    - 경유_하차 ↔ 픽업_경유: 한 택시가 먼 출발지에서 출발해 다른 사람을 픽업 후 목적지로
+    - 분기점_환승 ↔ 합류점_환승: 한 명은 대중교통/택시로 합류점까지 와서 같이 탐
+    """
+    r = compute_split(dest, o_a, o_b, hour=hour)
+    방식 = r.pop("방식")
+    r["A_출발지"], r["B_출발지"] = o_a["name"], o_b["name"]
+    r["목적지"] = dest["name"]
+    # compute_split 기준 off = (역방향에서 먼저 갈라지는) → 순방향에서 '나중에 합류/픽업되는' 사람
+    join_name = r.pop("분기점")
+    late_name = r.pop("내리는_사람")     # 픽업/합류하는 사람의 출발지
+    first_name = r.pop("끝까지_타는_사람")  # 처음부터 택시 타는 사람의 출발지
+    r.pop("분기점_안내", None)
+    r.pop("갈아탈_교통수단", None)
+    r.pop("출발", None); r.pop("A_목적지", None); r.pop("B_목적지", None)
+    if "분기점_좌표" in r:
+        r["합류점_좌표"] = r.pop("분기점_좌표")
+    if "대안" in r:
+        r["대안"] = r["대안"].replace("경유 하차", "픽업 경유").replace("분기점 환승", "합류점 환승")
+
+    if 방식 == "따로_타기":
+        r["방식"] = "따로_타기"
+        r["안내"] = (
+            f"🚕 이 경우엔 합승보다 각자 이동하는 게 더 낫습니다. "
+            f"{o_a['name']} 출발 {r['A_혼자']:,}원, {o_b['name']} 출발 {r['B_혼자']:,}원."
+        )
+    elif 방식 == "경유_하차":
+        r["방식"] = "픽업_경유"
+        r["픽업_장소"] = late_name
+        r["안내"] = (
+            f"👉 {first_name}에서 택시를 타고 {late_name}에 들러 친구를 태운 뒤, "
+            f"그대로 함께 {dest['name']}까지 갑니다. 한 명은 이동할 필요가 없어 가장 편한 방식입니다."
+        )
+    else:  # 분기점_환승 → 합류점_환승
+        r["방식"] = "합류점_환승"
+        r["합류점"] = join_name
+        r["안내"] = (
+            f"👉 {first_name}에서 출발하는 사람이 택시를 타고, "
+            f"{late_name}에서 출발하는 사람은 대중교통이나 택시로 '{join_name}' 부근까지 와 주세요. "
+            f"거기서 합류해 함께 택시로 {dest['name']}까지 갑니다."
+        )
+    r["먼저_타는_사람"] = first_name
+    r["나중에_타는_사람"] = late_name
+    return r
 
 
 def _pt(p: dict) -> str:
